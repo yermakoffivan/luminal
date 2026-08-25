@@ -184,6 +184,7 @@ struct SearchProfileBucketContext {
 
 struct Finalist<M> {
     metric: M,
+    genome: IndexedChoiceSet,
     pre_unroll: Option<LLIRGraph>,
     llir: LLIRGraph,
 }
@@ -240,11 +241,25 @@ impl<'a> From<&'a BucketLLIR> for BucketLLIRRef<'a> {
 
 /// A bucket for a dynamic dimension, defining a range of valid values.
 /// For an exact value, use `min == max` (zero-length range).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct DimBucket {
     pub min: usize,
     pub max: usize,
     representative_override: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ScheduleBucket {
+    egraph: SerializedEGraph,
+    choices: Vec<(String, String)>,
+    bucket_indices: DynMap,
+    representative_dyn_map: DynMap,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SelectedSchedule {
+    dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
+    buckets: Vec<ScheduleBucket>,
 }
 
 impl DimBucket {
@@ -635,12 +650,64 @@ pub struct Graph {
     /// Stored as plain data so it survives cross-binary type identity mismatches
     /// when external backend plugins are compiled separately.
     pub input_meta: FxHashMap<NodeIndex, (String, DType)>,
+    selected_schedule: Option<SelectedSchedule>,
 }
 
 impl Graph {
     /// Create a new graph
     pub fn new() -> Graph {
         Graph::default()
+    }
+
+    pub fn selected_schedule(&self) -> Option<&SelectedSchedule> {
+        self.selected_schedule.as_ref()
+    }
+
+    pub fn from_selected_schedule(
+        dyn_map: DynMap,
+        input_meta: FxHashMap<NodeIndex, (String, DType)>,
+        schedule: SelectedSchedule,
+    ) -> Self {
+        Self {
+            dyn_map,
+            input_meta,
+            selected_schedule: Some(schedule),
+            ..Self::default()
+        }
+    }
+
+    pub fn load_selected_schedule<R: Runtime + 'static>(
+        &mut self,
+        runtime: &mut R,
+    ) -> Result<(), String> {
+        let schedule = self
+            .selected_schedule
+            .as_ref()
+            .ok_or_else(|| "graph has no selected schedule".to_string())?;
+        if !self.custom_ops.is_empty() {
+            return Err("selected schedules with custom ops are not serializable".to_string());
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ops = R::Ops::into_vec();
+            ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
+            let bucket_llirs = schedule
+                .buckets
+                .iter()
+                .map(|bucket| {
+                    let mut extractor = LlirExtractor::new(&bucket.egraph, &ops);
+                    let choices = extractor.index_named_choices(&bucket.choices);
+                    let packed = extractor.extract_indexed_packed(&choices, &[], None);
+                    (
+                        bucket.bucket_indices.clone(),
+                        bucket.representative_dyn_map.clone(),
+                        unroll_packed_llir(packed),
+                    )
+                })
+                .collect::<Vec<_>>();
+            runtime.load_llir_buckets(&schedule.dim_buckets, &bucket_llirs);
+        }));
+        result.map_err(|_| "selected schedule could not be loaded".to_string())
     }
 
     fn run_auto_loop_rolling_prepass(&mut self, options: &CompileOptions) {
@@ -2016,6 +2083,16 @@ impl Graph {
             let finalist = candidates.finalists.remove(0);
             Self::dump_selected_finalist(&finalist, &self.dyn_map, None);
 
+            let extractor = LlirExtractor::new(&self.egraphs[0], self.ops.as_ref().unwrap());
+            self.selected_schedule = Some(SelectedSchedule {
+                dim_buckets: FxHashMap::default(),
+                buckets: vec![ScheduleBucket {
+                    egraph: self.egraphs[0].clone(),
+                    choices: extractor.named_choices(&finalist.genome),
+                    bucket_indices: FxHashMap::default(),
+                    representative_dyn_map: self.dyn_map.clone(),
+                }],
+            });
             runtime.clear_intermediate_buffers();
             runtime.load_llir(&finalist.llir);
             runtime
@@ -2250,6 +2327,7 @@ impl Graph {
             };
 
             let mut bucket_llirs = Vec::with_capacity(n_combos);
+            let mut schedule_buckets = Vec::with_capacity(n_combos);
             for (bucket_idx, (mut bucket, candidate_idx)) in bucket_searches
                 .into_iter()
                 .zip(selected_indices)
@@ -2261,6 +2339,14 @@ impl Graph {
                     &bucket.context.representative_dyn_map,
                     Some((bucket_idx, n_combos)),
                 );
+                let extractor =
+                    LlirExtractor::new(&self.egraphs[bucket_idx], self.ops.as_ref().unwrap());
+                schedule_buckets.push(ScheduleBucket {
+                    egraph: self.egraphs[bucket_idx].clone(),
+                    choices: extractor.named_choices(&finalist.genome),
+                    bucket_indices: bucket.context.bucket_indices.clone(),
+                    representative_dyn_map: bucket.context.representative_dyn_map.clone(),
+                });
                 bucket_llirs.push((
                     bucket.context.bucket_indices,
                     bucket.context.representative_dyn_map,
@@ -2268,6 +2354,10 @@ impl Graph {
                 ));
             }
 
+            self.selected_schedule = Some(SelectedSchedule {
+                dim_buckets: self.search_space_dim_buckets.clone(),
+                buckets: schedule_buckets,
+            });
             runtime.clear_intermediate_buffers();
             runtime.load_llir_buckets(&self.search_space_dim_buckets, &bucket_llirs);
             runtime
@@ -3004,6 +3094,7 @@ impl Graph {
             }
             candidates.finalists.push(Finalist {
                 metric,
+                genome,
                 pre_unroll,
                 llir: stitched,
             });
@@ -5004,6 +5095,34 @@ mod tests {
         }
     }
 
+    struct ArtifactLoadRuntime;
+
+    impl Runtime for ArtifactLoadRuntime {
+        type Ops = ();
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &DynMap,
+            _: usize,
+            _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
+        ) -> (Self::ProfileMetric, String) {
+            panic!("artifact loading must not profile schedules")
+        }
+    }
+
     #[derive(Default)]
     struct PreparedCandidateRuntime {
         prepared: usize,
@@ -5642,6 +5761,30 @@ mod tests {
             CompileOptions::default().search_time_limit(std::time::Duration::ZERO),
         );
         assert_eq!(PROFILE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn selected_schedule_round_trip_skips_search() {
+        let mut graph = Graph::new();
+        let _ = graph.tensor(4).sin().output();
+        graph.build_search_space::<CountingRuntime>(CompileOptions::default());
+
+        PROFILE_CALLS.store(0, Ordering::SeqCst);
+        let _ = graph.search(
+            CountingRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
+        let bytes = serde_json::to_vec(graph.selected_schedule().unwrap()).unwrap();
+        let schedule = serde_json::from_slice(&bytes).unwrap();
+        let mut loaded = Graph::from_selected_schedule(
+            graph.dyn_map.clone(),
+            graph.input_meta.clone(),
+            schedule,
+        );
+
+        loaded
+            .load_selected_schedule(&mut ArtifactLoadRuntime)
+            .unwrap();
     }
 
     #[test]
